@@ -1,376 +1,428 @@
 #!/usr/bin/env python3
 """
-MailHub - Recruiter Agent for Interview Coordination
-Handles back and forth conversations with applicants and coordinates interviews.
+MailHub - AI Recruitment Agent with AgentMail
+Fixed version with proper email sending and AI responses
 """
 
 import os
 import time
+import json
 import logging
-from typing import Dict, List, Optional, Any
-from enum import Enum
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from dotenv import load_dotenv
 from agentmail import AgentMail
-from agentmail.core.api_error import ApiError
 from anthropic import Anthropic
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-class EmailCategory(Enum):
-    """Email categorization types"""
-    RECEIVE_TIMES_FROM_APPLICANT = "Receive times from applicant"
-    RECEIVES_CONFIRMATION_FROM_INTERVIEWER = "Receives confirmation from Interviewer"
-    RECEIVES_DENIAL_FROM_INTERVIEWER = "Receives denial from Interviewer"
-    RECEIVES_QUESTION_FROM_APPLICANT = "Receives question from applicant"
-    RECEIVES_SPAM = "Receives Spam"
 
 @dataclass
 class EmailMessage:
     """Email message structure"""
     id: str
     from_email: str
-    to_email: str
     subject: str
     content: str
     thread_id: Optional[str] = None
+    timestamp: Optional[datetime] = None
 
 @dataclass
-class InterviewState:
-    """Track interview coordination state"""
-    applicant_email: str
-    status: str  # "waiting_for_times", "waiting_for_interviewer_response", "confirmed", "denied"
-    proposed_times: Optional[List[str]] = None
-    selected_time: Optional[str] = None
+class CandidateState:
+    """Track candidate through recruitment process"""
+    email: str
+    status: str  # "new", "screening", "scheduling", "interviewed", "rejected", "hired"
+    thread_id: str
+    notes: str = ""
+    score: Optional[int] = None
 
 class MailHubAgent:
-    """Main MailHub agent for handling recruitment emails"""
+    """AI Recruitment Agent using AgentMail and Claude"""
     
-    def __init__(self, agentmail_api_key: str, anthropic_api_key: str):
-        """Initialize the MailHub agent"""
-        self.agentmail_client = AgentMail(api_key=agentmail_api_key)
-        self.anthropic_client = Anthropic(api_key=anthropic_api_key)
-        self.interviewer_email = "lijackie@umich.edu"
-        self.interview_states: Dict[str, InterviewState] = {}
-        self.processed_emails: set = set()  # Track processed email IDs
-        self.load_processed_emails()  # Load from file if exists
+    def __init__(self):
+        """Initialize the recruitment agent"""
+        # API clients
+        self.agentmail = AgentMail(api_key=os.getenv("AGENTMAIL_API_KEY"))
+        self.claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         
-        # Create or get the inbox for receiving emails
-        self.inbox = self.create_or_get_inbox()
+        # Configuration
+        self.interviewer_email = os.getenv("INTERVIEWER_EMAIL", "interviewer@company.com")
         
-        logger.info("MailHub Agent initialized")
-    
-    def load_processed_emails(self):
-        """Load processed email IDs from file"""
+        # State tracking
+        self.processed_emails = set()
+        self.candidates = {}  # email -> CandidateState
+        self.conversations = {}  # thread_id -> conversation history
+        
+        # Create or get inbox
+        self.inbox = self.setup_inbox()
+        
+    def setup_inbox(self):
+        """Create or retrieve AgentMail inbox"""
         try:
-            if os.path.exists("processed_emails.txt"):
-                with open("processed_emails.txt", "r") as f:
-                    for line in f:
-                        email_id = line.strip()
-                        if email_id:
-                            self.processed_emails.add(email_id)
-                logger.info(f"Loaded {len(self.processed_emails)} processed email IDs")
-        except Exception as e:
-            logger.error(f"Error loading processed emails: {e}")
-    
-    def save_processed_emails(self):
-        """Save processed email IDs to file"""
-        try:
-            with open("processed_emails.txt", "w") as f:
-                for email_id in self.processed_emails:
-                    f.write(f"{email_id}\n")
-        except Exception as e:
-            logger.error(f"Error saving processed emails: {e}")
-    
-    def create_or_get_inbox(self):
-        """Create or get the AgentMail inbox for receiving emails"""
-        try:
-            # Try to list existing inboxes first
-            inboxes_response = self.agentmail_client.inboxes.list()
+            # Try to create a new inbox with unique username
+            username = f"recruiter-{int(time.time())}"
+            inbox = self.agentmail.inboxes.create(
+                username=username,
+                display_name="AI Recruiter"
+            )
+            logger.info(f"✅ Created inbox: {inbox.inbox_id}")
+            print(f"\n📧 Send applications to: {inbox.inbox_id}")
+            return inbox
             
-            # Look for an existing inbox with our domain
-            for inbox in inboxes_response.inboxes:
-                if "mailhub" in inbox.inbox_id.lower():
-                    logger.info(f"Found existing inbox: {inbox.inbox_id}")
+        except Exception as e:
+            logger.error(f"Error creating inbox: {e}")
+            # Try to get existing inbox
+            try:
+                inboxes = self.agentmail.inboxes.list()
+                if inboxes.inboxes:
+                    inbox = inboxes.inboxes[0]
+                    logger.info(f"Using existing inbox: {inbox.inbox_id}")
                     return inbox
-            
-            # Create a new inbox if none found
-            logger.info("Creating new AgentMail inbox...")
-            new_inbox = self.agentmail_client.inboxes.create(
-                username="mailhub",
-                display_name="MailHub Recruiter Agent"
-            )
-            logger.info(f"Created new inbox: {new_inbox.inbox_id}")
-            return new_inbox
-            
-        except Exception as e:
-            logger.error(f"Error creating/getting inbox: {e}")
-            # Return a placeholder if we can't create/get inbox
-            return None
+            except:
+                raise Exception("Could not create or get inbox")
     
-    def categorize_email(self, email_content: str, sender: str) -> EmailCategory:
-        """Use Claude 3.5 to categorize incoming emails"""
+    def generate_response(self, email: EmailMessage, context: str = "") -> str:
+        """Generate AI response using Claude"""
+        
+        # Get conversation history if it exists
+        history = ""
+        if email.thread_id and email.thread_id in self.conversations:
+            history = f"Previous conversation:\n{self.conversations[email.thread_id]}\n\n"
+        
+        # Generate response
+        response = self.claude.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a friendly, professional AI recruiter for a tech startup.
+                    
+Company: TechCorp (AI/ML startup, remote-first, great culture)
+Hiring for: Software Engineers, ML Engineers, Product Managers
+Process: Initial screen → Technical interview → Culture fit → Offer
+
+Your personality:
+- Warm and enthusiastic with qualified candidates
+- Professional but not robotic
+- Encourage candidates even when rejecting
+- Always provide clear next steps
+- Use the candidate's name when you know it
+
+Remember previous conversation context when provided."""
+                },
+                {
+                    "role": "user",
+                    "content": f"""{history}{context}
+
+Email from: {email.from_email}
+Subject: {email.subject}
+Content: {email.content}
+
+Write a response email that's helpful and professional."""
+                }
+            ]
+        )
+        
+        return response.content[0].text
+    
+    def send_email(self, to: str, subject: str, content: str, thread_id: Optional[str] = None) -> bool:
+        """Actually send email via AgentMail"""
         try:
-            prompt = f"""
-            Analyze this email and categorize it into one of these categories:
-            1. "Receive times from applicant" - Email contains available interview times/dates from an applicant
-            2. "Receives confirmation from Interviewer" - Email contains confirmation/approval from interviewer
-            3. "Receives denial from Interviewer" - Email contains rejection/denial from interviewer
-            4. "Receives question from applicant" - Email contains questions from an applicant
-            5. "Receives Spam" - Email is spam or irrelevant
-            
-            Email from: {sender}
-            Email content: {email_content}
-            
-            Respond with ONLY the category name from the list above.
-            """
-            # Need to ensure that there is an accurate method to check to see if the applicant is in the interview process.
-            
-            response = self.anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=50,
-                messages=[{"role": "user", "content": prompt}]
+            # Send the email
+            response = self.agentmail.messages.send(
+                inbox_id=self.inbox.inbox_id,
+                to=[to],
+                subject=subject,
+                text=content,
+                thread_id=thread_id
             )
             
-            category_text = response.content[0].text.strip()
+            logger.info(f"✅ Email sent to {to}")
             
-            # Map response to enum
-            for category in EmailCategory:
-                if category.value.lower() in category_text.lower():
-                    logger.info(f"Email categorized as: {category.value}")
-                    return category
+            # Store in conversation history
+            if thread_id:
+                if thread_id not in self.conversations:
+                    self.conversations[thread_id] = ""
+                self.conversations[thread_id] += f"\nOur response:\n{content}\n"
             
-            # Default to spam if no match
-            logger.warning(f"Could not categorize email, defaulting to spam. Response: {category_text}")
-            return EmailCategory.RECEIVES_SPAM
-            
-        except Exception as e:
-            logger.error(f"Error categorizing email: {e}")
-            return EmailCategory.RECEIVES_SPAM
-    
-    def send_email(self, to_email: str, subject: str, content: str, thread_id: Optional[str] = None) -> bool:
-        """Send email using AgentMail"""
-        try:
-            logger.info(f"Sending email to {to_email}: {subject}")
-            logger.info(f"Content: {content}")
-            
-            # Create a draft first
-            draft_data = {
-                "to": [to_email],
-                "subject": subject,
-                "text": content
-            }
-            
-            # For now, we'll log the email content since we need to understand
-            # the exact AgentMail API for sending emails
-            logger.info(f"Would send email with data: {draft_data}")
-            
-            # TODO: Implement actual AgentMail send functionality
-            # This requires understanding the exact API for sending emails
             return True
             
         except Exception as e:
-            logger.error(f"Error sending email: {e}")
+            logger.error(f"❌ Failed to send email: {e}")
             return False
     
-    def get_new_emails(self) -> List[EmailMessage]:
-        """Poll for new emails from AgentMail (last 24 hours only)"""
-        try:
-            if not self.inbox:
-                logger.error("No inbox available for receiving emails")
-                return []
-            
-            logger.info(f"Polling for new emails in inbox: {self.inbox.inbox_id}")
-            
-            # Calculate 24 hours ago
-            twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
-            
-            # Get threads (conversations) from AgentMail
-            threads_response = self.agentmail_client.threads.list(limit=50)  # Increased limit to catch more emails
-            
-            emails = []
-            for thread in threads_response.threads:
-                # Check if email is from the last 24 hours
-                if thread.timestamp and thread.timestamp >= twenty_four_hours_ago:
-                    # Get the latest message from each thread
-                    thread_details = self.agentmail_client.threads.get(thread.thread_id)
-                    
-                    # Convert thread to EmailMessage
-                    email = EmailMessage(
-                        id=thread.thread_id,
-                        from_email=thread.senders[0] if thread.senders else "unknown",
-                        to_email=self.inbox.inbox_id,  # Our AgentMail inbox
-                        subject=thread.subject or "No Subject",
-                        content=thread.preview or "",
-                        thread_id=thread.thread_id
-                    )
-                    emails.append(email)
-                else:
-                    # Skip emails older than 24 hours
-                    logger.debug(f"Skipping email from {thread.timestamp} (older than 24 hours)")
-            
-            logger.info(f"Found {len(emails)} emails from the last 24 hours")
-            return emails
-            
-        except Exception as e:
-            logger.error(f"Error retrieving emails: {e}")
-            return []
-    
-    def handle_interview_coordination(self, email: EmailMessage) -> None:
-        """Handle interview coordination workflow"""
-        applicant_email = email.from_email
+    def categorize_email(self, email: EmailMessage) -> str:
+        """Categorize the type of email"""
         
-        if applicant_email not in self.interview_states:
-            # New applicant - start interview process
-            self.interview_states[applicant_email] = InterviewState(
-                applicant_email=applicant_email,
-                status="waiting_for_times"
-            )
-            
-            # Send initial email to applicant requesting available times
-            self.send_email(
-                to_email=applicant_email,
-                subject="Interview Coordination - Available Times",
-                content="test email for coordinating interviews"
-            )
-            logger.info(f"Started interview process for {applicant_email}")
+        response = self.claude.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=50,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Categorize this email into ONE of these categories:
+                    - new_application (someone applying for a job)
+                    - scheduling_response (candidate providing availability)
+                    - interviewer_feedback (interviewer responding about a candidate)
+                    - question (candidate asking questions)
+                    - follow_up (candidate following up on application)
+                    - other
+                    
+                    Respond with just the category name."""
+                },
+                {
+                    "role": "user",
+                    "content": email.content
+                }
+            ]
+        )
+        
+        category = response.content[0].text.strip().lower()
+        logger.info(f"📂 Email categorized as: {category}")
+        return category
     
-    def handle_question_from_applicant(self, email: EmailMessage) -> None:
-        """Handle questions from applicants"""
-        # Send automated response
+    def evaluate_candidate(self, email: EmailMessage) -> Dict:
+        """Evaluate a candidate application"""
+        
+        response = self.claude.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Evaluate this job application. Return a JSON response with:
+                    - score (1-10): How qualified is this candidate?
+                    - qualified (boolean): Should we move forward?
+                    - missing_skills (list): What key skills are missing?
+                    - strengths (list): What are their strengths?
+                    - next_step (string): What should we do next?
+                    - reasoning (string): Brief explanation"""
+                },
+                {
+                    "role": "user",
+                    "content": f"Application email:\n{email.content}"
+                }
+            ]
+        )
+        
+        try:
+            evaluation = json.loads(response.content[0].text)
+            logger.info(f"📊 Candidate scored: {evaluation.get('score', 'N/A')}/10")
+            return evaluation
+        except:
+            return {
+                "score": 5,
+                "qualified": True,
+                "reasoning": "Could not parse evaluation",
+                "next_step": "schedule_screen"
+            }
+    
+    def process_new_application(self, email: EmailMessage):
+        """Handle new job application"""
+        
+        # Evaluate candidate
+        evaluation = self.evaluate_candidate(email)
+        
+        # Store candidate state
+        self.candidates[email.from_email] = CandidateState(
+            email=email.from_email,
+            status="screening" if evaluation["qualified"] else "rejected",
+            thread_id=email.thread_id or email.id,
+            score=evaluation.get("score", 0),
+            notes=evaluation.get("reasoning", "")
+        )
+        
+        # Generate appropriate response
+        if evaluation["qualified"]:
+            context = f"""This candidate scored {evaluation['score']}/10.
+            Strengths: {evaluation.get('strengths', [])}
+            Be enthusiastic and invite them to schedule a screening call.
+            Ask for their availability in the next week."""
+        else:
+            context = f"""This candidate isn't a fit right now.
+            Missing: {evaluation.get('missing_skills', [])}
+            Be encouraging and suggest they apply again in the future after gaining more experience."""
+        
+        response_content = self.generate_response(email, context)
+        
+        # Send response
         self.send_email(
-            to_email=email.from_email,
-            subject="Re: " + email.subject,
-            content="test email to applicant for back and forth conversation",
+            to=email.from_email,
+            subject=f"Re: {email.subject}" if not email.subject.startswith("Re:") else email.subject,
+            content=response_content,
             thread_id=email.thread_id
         )
-        logger.info(f"Responded to question from {email.from_email}")
+        
+        # If qualified, notify interviewer
+        if evaluation["qualified"]:
+            self.send_email(
+                to=self.interviewer_email,
+                subject=f"New Qualified Candidate: {email.from_email}",
+                content=f"""New candidate scored {evaluation['score']}/10:
+
+From: {email.from_email}
+Strengths: {', '.join(evaluation.get('strengths', []))}
+
+Application:
+{email.content[:500]}...
+
+They will be scheduling a screening call soon."""
+            )
     
-    def process_email(self, email: EmailMessage) -> None:
-        """Process incoming email based on category"""
-        # Check if email has already been processed
-        if email.id in self.processed_emails:
+    def process_scheduling_response(self, email: EmailMessage):
+        """Handle scheduling responses from candidates"""
+        
+        # Extract availability
+        response = self.claude.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Extract the available times from this email:\n{email.content}\nList them clearly."
+                }
+            ]
+        )
+        
+        availability = response.content[0].text
+        
+        # Forward to interviewer
+        self.send_email(
+            to=self.interviewer_email,
+            subject=f"Interview Availability: {email.from_email}",
+            content=f"""Candidate has provided availability:
+
+{availability}
+
+Original message:
+{email.content}
+
+Please reply with your preferred time."""
+        )
+        
+        # Acknowledge to candidate
+        response_content = self.generate_response(
+            email,
+            "Thank them for the availability and let them know we'll confirm a time within 24 hours."
+        )
+        
+        self.send_email(
+            to=email.from_email,
+            subject=f"Re: {email.subject}",
+            content=response_content,
+            thread_id=email.thread_id
+        )
+        
+        # Update candidate state
+        if email.from_email in self.candidates:
+            self.candidates[email.from_email].status = "scheduling"
+    
+    def process_email(self, message):
+        """Main email processing logic"""
+        
+        # Skip if already processed
+        if message.id in self.processed_emails:
             return
-
-        logger.info(f"Processing email from {email.from_email}")
-
-        category = self.categorize_email(email.content, email.from_email)
-        logger.info(f"Email categorized as: {category.value}")
         
-        # Mark email as processed
-        self.processed_emails.add(email.id)
-        self.save_processed_emails()
+        # Mark as processed
+        self.processed_emails.add(message.id)
         
-        if category == EmailCategory.RECEIVE_TIMES_FROM_APPLICANT:
-            # Forward times to interviewer
+        # Create EmailMessage object
+        email = EmailMessage(
+            id=message.id,
+            from_email=message.from_email,
+            subject=message.subject or "No Subject",
+            content=message.text or "",
+            thread_id=getattr(message, 'thread_id', None)
+        )
+        
+        logger.info(f"📨 Processing email from: {email.from_email}")
+        
+        # Store in conversation history
+        if email.thread_id:
+            if email.thread_id not in self.conversations:
+                self.conversations[email.thread_id] = ""
+            self.conversations[email.thread_id] += f"\nFrom {email.from_email}:\n{email.content}\n"
+        
+        # Categorize and route email
+        category = self.categorize_email(email)
+        
+        if category == "new_application":
+            self.process_new_application(email)
+        elif category == "scheduling_response":
+            self.process_scheduling_response(email)
+        elif email.from_email == self.interviewer_email:
+            # Handle interviewer responses
+            self.handle_interviewer_response(email)
+        else:
+            # General response for questions, follow-ups, etc.
+            response_content = self.generate_response(email)
             self.send_email(
-                to_email=self.interviewer_email,
-                subject=f"Interview Times from {email.from_email}",
-                content=f"Applicant {email.from_email} has provided the following available times:\n\n{email.content}"
+                to=email.from_email,
+                subject=f"Re: {email.subject}",
+                content=response_content,
+                thread_id=email.thread_id
             )
-            
-            # Update state
-            if email.from_email in self.interview_states:
-                self.interview_states[email.from_email].status = "waiting_for_interviewer_response"
-                self.interview_states[email.from_email].proposed_times = [email.content]
-            
-            logger.info(f"Forwarded times from {email.from_email} to interviewer")
-        
-        elif category == EmailCategory.RECEIVES_CONFIRMATION_FROM_INTERVIEWER:
-            # Interviewer confirmed - notify applicant
-            # Extract applicant email from the email content or use a different method
-            # For now, we'll need to implement a way to track which applicant this is for
-            
-            # Send confirmation to applicant
-            self.send_email(
-                to_email=email.from_email,  # This might need to be the applicant's email
-                subject="Interview Confirmed",
-                content="test email for coordinating interviews"
-            )
-            logger.info("Sent interview confirmation to applicant")
-        
-        elif category == EmailCategory.RECEIVES_DENIAL_FROM_INTERVIEWER:
-            # Interviewer denied - ask applicant for new times
-            # Similar to confirmation, we need to identify the applicant
-            
-            self.send_email(
-                to_email=email.from_email,  # This might need to be the applicant's email
-                subject="Interview Times - Please Provide Alternatives",
-                content="test email for coordinating interviews"
-            )
-            logger.info("Requested new times from applicant")
-        
-        elif category == EmailCategory.RECEIVES_QUESTION_FROM_APPLICANT:
-            self.handle_question_from_applicant(email)
-        
-        elif category == EmailCategory.RECEIVES_SPAM:
-            logger.info(f"Ignoring spam email from {email.from_email}")
     
-    def run(self) -> None:
-        """Main application loop"""
-        logger.info("Starting MailHub Agent...")
+    def handle_interviewer_response(self, email: EmailMessage):
+        """Handle responses from interviewer"""
+        # This is simplified - in production you'd parse the response
+        # and forward confirmation to the right candidate
+        logger.info(f"Interviewer responded: {email.subject}")
+    
+    def run(self):
+        """Main loop"""
+        print(f"\n🚀 MailHub Agent running!")
+        print(f"📧 Inbox: {self.inbox.inbox_id}")
+        print(f"⏰ Checking for emails every 10 seconds...")
+        print(f"\nPress Ctrl+C to stop\n")
         
         while True:
             try:
-                # Poll for new emails
-                new_emails = self.get_new_emails()
+                # Get messages
+                messages = self.agentmail.messages.list(
+                    inbox_id=self.inbox.inbox_id,
+                    limit=20
+                )
                 
-                for email in new_emails:
-                    self.process_email(email)
+                # Process each message
+                for message in messages.messages:
+                    self.process_email(message)
                 
-                # Wait before next poll
-                time.sleep(30)  # Poll every 30 seconds
+                # Wait before next check
+                time.sleep(10)
                 
             except KeyboardInterrupt:
-                logger.info("Shutting down MailHub Agent...")
+                print("\n👋 Shutting down...")
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
-                time.sleep(60)  # Wait longer on error
+                time.sleep(30)
 
 def main():
-    """Main entry point"""
-    # Get API keys from environment variables
-    agentmail_api_key = os.getenv("AGENTMAIL_API_KEY")
-    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    """Entry point"""
     
-    if not agentmail_api_key:
-        logger.error("AGENTMAIL_API_KEY environment variable not set")
+    # Check for required environment variables
+    if not os.getenv("AGENTMAIL_API_KEY"):
+        print("❌ Error: AGENTMAIL_API_KEY not set in .env file")
         return
     
-    if not anthropic_api_key:
-        logger.error("ANTHROPIC_API_KEY environment variable not set")
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("❌ Error: ANTHROPIC_API_KEY not set in .env file")
         return
     
-    # Create and run the agent
-    agent = MailHubAgent(agentmail_api_key, anthropic_api_key)
-    
-    # Print the inbox information for Gmail forwarding setup
-    if agent.inbox:
-        print(f"\n📧 AgentMail Inbox Created: {agent.inbox.inbox_id}")
-        print(f"\n📋 To set up Gmail forwarding from MailHub6767@gmail.com:")
-        print(f"   1. Go to Gmail settings for MailHub6767@gmail.com")
-        print(f"   2. Go to 'Forwarding and POP/IMAP'")
-        print(f"   3. Add forwarding address: {agent.inbox.inbox_id}")
-        print(f"   4. Verify the forwarding address")
-        print(f"   5. Select 'Forward a copy of incoming mail to'")
-        print(f"   6. Choose 'Keep Gmail's copy in the Inbox'")
-        print(f"   7. Save changes")
-        print(f"\n🚀 Starting MailHub Agent...")
-    else:
-        print("❌ Failed to create AgentMail inbox. Check your API key and try again.")
-        return
-    
+    # Create and run agent
+    agent = MailHubAgent()
     agent.run()
 
 if __name__ == "__main__":

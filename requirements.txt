@@ -1,0 +1,2 @@
+agentmail==0.0.60
+anthropic==0.68.1

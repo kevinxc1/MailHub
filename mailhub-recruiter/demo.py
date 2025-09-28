@@ -47,7 +47,7 @@ def demo_candidate_evaluation():
         
         # Evaluate the candidate
         response = claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-20250118",
             max_tokens=300,
             messages=[
                 {
@@ -91,7 +91,7 @@ def demo_response_generation():
         
         # Generate a response
         response = claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-20250118",
             max_tokens=500,
             messages=[
                 {

@@ -104,7 +104,7 @@ class MailHubAgent:
         
         # Generate response
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-20250118",
             max_tokens=500,
             messages=[
                 {
@@ -142,8 +142,9 @@ Write a response email that's helpful and professional."""
     def send_email(self, to: str, subject: str, content: str, thread_id: Optional[str] = None) -> bool:
         """Actually send email via AgentMail"""
         try:
-            # Send the email
-            response = self.agentmail.messages.send(
+            # Send the email using the correct API structure
+            # Note: Using inboxes.messages.create() as per AgentMail API documentation
+            response = self.agentmail.inboxes.messages.create(
                 inbox_id=self.inbox.inbox_id,
                 to=[to],
                 subject=subject,
@@ -152,6 +153,7 @@ Write a response email that's helpful and professional."""
             )
             
             logger.info(f"✅ Email sent to {to}")
+            logger.debug(f"Response: {response}")
             
             # Store in conversation history
             if thread_id:
@@ -161,15 +163,20 @@ Write a response email that's helpful and professional."""
             
             return True
             
+        except AttributeError as e:
+            logger.error(f"❌ AgentMail API structure error: {e}")
+            logger.error("Check if API method is inboxes.messages.create() or .reply()")
+            return False
         except Exception as e:
             logger.error(f"❌ Failed to send email: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
             return False
     
     def categorize_email(self, email: EmailMessage) -> str:
         """Categorize the type of email"""
         
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-20250118",
             max_tokens=50,
             messages=[
                 {
@@ -199,7 +206,7 @@ Write a response email that's helpful and professional."""
         """Evaluate a candidate application"""
         
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-20250118",
             max_tokens=300,
             messages=[
                 {
@@ -298,7 +305,7 @@ They will be scheduling a screening call soon."""
         
         # Extract availability
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-20250118",
             max_tokens=200,
             messages=[
                 {
@@ -405,8 +412,9 @@ Please reply with your preferred time."""
         
         while True:
             try:
-                # Get messages
-                messages = self.agentmail.messages.list(
+                # Get messages using correct API structure
+                # Note: Using inboxes.messages.list() as per AgentMail API documentation
+                messages = self.agentmail.inboxes.messages.list(
                     inbox_id=self.inbox.inbox_id,
                     limit=20
                 )

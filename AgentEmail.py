@@ -10,6 +10,7 @@ import logging
 from typing import Dict, List, Optional, Any
 from enum import Enum
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from agentmail import AgentMail
@@ -61,11 +62,35 @@ class MailHubAgent:
         self.anthropic_client = Anthropic(api_key=anthropic_api_key)
         self.interviewer_email = "lijackie@umich.edu"
         self.interview_states: Dict[str, InterviewState] = {}
+        self.processed_emails: set = set()  # Track processed email IDs
+        self.load_processed_emails()  # Load from file if exists
         
         # Create or get the inbox for receiving emails
         self.inbox = self.create_or_get_inbox()
         
         logger.info("MailHub Agent initialized")
+    
+    def load_processed_emails(self):
+        """Load processed email IDs from file"""
+        try:
+            if os.path.exists("processed_emails.txt"):
+                with open("processed_emails.txt", "r") as f:
+                    for line in f:
+                        email_id = line.strip()
+                        if email_id:
+                            self.processed_emails.add(email_id)
+                logger.info(f"Loaded {len(self.processed_emails)} processed email IDs")
+        except Exception as e:
+            logger.error(f"Error loading processed emails: {e}")
+    
+    def save_processed_emails(self):
+        """Save processed email IDs to file"""
+        try:
+            with open("processed_emails.txt", "w") as f:
+                for email_id in self.processed_emails:
+                    f.write(f"{email_id}\n")
+        except Exception as e:
+            logger.error(f"Error saving processed emails: {e}")
     
     def create_or_get_inbox(self):
         """Create or get the AgentMail inbox for receiving emails"""
@@ -109,6 +134,7 @@ class MailHubAgent:
             
             Respond with ONLY the category name from the list above.
             """
+            # Need to ensure that there is an accurate method to check to see if the applicant is in the interview process.
             
             response = self.anthropic_client.messages.create(
                 model="claude-sonnet-4-20250514",
@@ -158,7 +184,7 @@ class MailHubAgent:
             return False
     
     def get_new_emails(self) -> List[EmailMessage]:
-        """Poll for new emails from AgentMail"""
+        """Poll for new emails from AgentMail (last 24 hours only)"""
         try:
             if not self.inbox:
                 logger.error("No inbox available for receiving emails")
@@ -166,25 +192,34 @@ class MailHubAgent:
             
             logger.info(f"Polling for new emails in inbox: {self.inbox.inbox_id}")
             
+            # Calculate 24 hours ago
+            twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
+            
             # Get threads (conversations) from AgentMail
-            threads_response = self.agentmail_client.threads.list(limit=10)
+            threads_response = self.agentmail_client.threads.list(limit=50)  # Increased limit to catch more emails
             
             emails = []
             for thread in threads_response.threads:
-                # Get the latest message from each thread
-                thread_details = self.agentmail_client.threads.get(thread.thread_id)
-                
-                # Convert thread to EmailMessage
-                email = EmailMessage(
-                    id=thread.thread_id,
-                    from_email=thread.senders[0] if thread.senders else "unknown",
-                    to_email=self.inbox.inbox_id,  # Our AgentMail inbox
-                    subject=thread.subject or "No Subject",
-                    content=thread.preview or "",
-                    thread_id=thread.thread_id
-                )
-                emails.append(email)
+                # Check if email is from the last 24 hours
+                if thread.timestamp and thread.timestamp >= twenty_four_hours_ago:
+                    # Get the latest message from each thread
+                    thread_details = self.agentmail_client.threads.get(thread.thread_id)
+                    
+                    # Convert thread to EmailMessage
+                    email = EmailMessage(
+                        id=thread.thread_id,
+                        from_email=thread.senders[0] if thread.senders else "unknown",
+                        to_email=self.inbox.inbox_id,  # Our AgentMail inbox
+                        subject=thread.subject or "No Subject",
+                        content=thread.preview or "",
+                        thread_id=thread.thread_id
+                    )
+                    emails.append(email)
+                else:
+                    # Skip emails older than 24 hours
+                    logger.debug(f"Skipping email from {thread.timestamp} (older than 24 hours)")
             
+            logger.info(f"Found {len(emails)} emails from the last 24 hours")
             return emails
             
         except Exception as e:
@@ -223,7 +258,18 @@ class MailHubAgent:
     
     def process_email(self, email: EmailMessage) -> None:
         """Process incoming email based on category"""
+        # Check if email has already been processed
+        if email.id in self.processed_emails:
+            return
+
+        logger.info(f"Processing email from {email.from_email}")
+
         category = self.categorize_email(email.content, email.from_email)
+        logger.info(f"Email categorized as: {category.value}")
+        
+        # Mark email as processed
+        self.processed_emails.add(email.id)
+        self.save_processed_emails()
         
         if category == EmailCategory.RECEIVE_TIMES_FROM_APPLICANT:
             # Forward times to interviewer
@@ -280,7 +326,6 @@ class MailHubAgent:
                 new_emails = self.get_new_emails()
                 
                 for email in new_emails:
-                    logger.info(f"Processing email from {email.from_email}")
                     self.process_email(email)
                 
                 # Wait before next poll

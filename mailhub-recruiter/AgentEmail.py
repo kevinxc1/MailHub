@@ -66,33 +66,37 @@ class MailHubAgent:
         self.inbox = self.setup_inbox()
         
     def setup_inbox(self):
-        """Create or retrieve AgentMail inbox"""
+        """Use the existing mailhub@agentmail.to inbox instead of creating new ones"""
         try:
-            # Try to create a new inbox with unique username
-            username = f"recruiter-{int(time.time())}"
-            inbox = self.agentmail.inboxes.create(
-                username=username,
-                display_name="AI Recruiter"
-            )
-            logger.info(f"✅ Created inbox: {inbox.inbox_id}")
-            print(f"\n📧 Send applications to: {inbox.inbox_id}")
-            return inbox
+            # Try to find existing mailhub inbox
+            inboxes_response = self.agentmail.inboxes.list()
+            
+            for inbox in inboxes_response.inboxes:
+                if "mailhub" in inbox.inbox_id.lower():
+                    logger.info(f"✅ Using existing inbox: {inbox.inbox_id}")
+                    print(f"\n📧 Send applications to: {inbox.inbox_id}")
+                    return inbox
+            
+            # If not found, use a simple object with the known address
+            class ExistingInbox:
+                def __init__(self):
+                    self.inbox_id = "mailhub@agentmail.to"
+                    self.created_at = None
+            
+            logger.info("✅ Using mailhub@agentmail.to")
+            print(f"\n📧 Send applications to: mailhub@agentmail.to")
+            return ExistingInbox()
             
         except Exception as e:
-            logger.error(f"Error creating inbox: {e}")
-            # Try to get existing inbox
-            try:
-                inboxes = self.agentmail.inboxes.list()
-                if inboxes.inboxes:
-                    inbox = inboxes.inboxes[0]
-                    logger.info(f"Using existing inbox: {inbox.inbox_id}")
-                    return inbox
-                else:
-                    logger.error("No existing inboxes found")
-                    raise Exception("Could not create inbox and no existing inboxes available")
-            except Exception as inbox_error:
-                logger.error(f"Error retrieving existing inboxes: {inbox_error}")
-                raise Exception("Could not create or get inbox")
+            logger.warning(f"Could not list inboxes: {e}")
+            # Fallback to known address
+            class ExistingInbox:
+                def __init__(self):
+                    self.inbox_id = "mailhub@agentmail.to"
+            
+            logger.info("✅ Using mailhub@agentmail.to (fallback)")
+            print(f"\n📧 Send applications to: mailhub@agentmail.to")
+            return ExistingInbox()
     
     def generate_response(self, email: EmailMessage, context: str = "") -> str:
         """Generate AI response using Claude"""
@@ -104,12 +108,9 @@ class MailHubAgent:
         
         # Generate response
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20250118",
+            model="claude-sonnet-4-20250514",
             max_tokens=500,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are a friendly, professional AI recruiter for a tech startup.
+            system="""You are a friendly, professional AI recruiter for a tech startup.
                     
 Company: TechCorp (AI/ML startup, remote-first, great culture)
 Hiring for: Software Engineers, ML Engineers, Product Managers
@@ -122,8 +123,8 @@ Your personality:
 - Always provide clear next steps
 - Use the candidate's name when you know it
 
-Remember previous conversation context when provided."""
-                },
+Remember previous conversation context when provided.""",
+            messages=[
                 {
                     "role": "user",
                     "content": f"""{history}{context}
@@ -139,34 +140,43 @@ Write a response email that's helpful and professional."""
         
         return response.content[0].text
     
-    def send_email(self, to: str, subject: str, content: str, thread_id: Optional[str] = None) -> bool:
-        """Actually send email via AgentMail"""
+    def send_email(self, to_email: str, subject: str, content: str, message_id: Optional[str] = None, thread_id: Optional[str] = None) -> bool:
+        """Send email via AgentMail - uses reply API when message_id provided"""
         try:
-            # Send the email using the correct API structure
-            # Note: Using inboxes.messages.create() as per AgentMail API documentation
-            response = self.agentmail.inboxes.messages.create(
-                inbox_id=self.inbox.inbox_id,
-                to=[to],
-                subject=subject,
-                text=content,
-                thread_id=thread_id
-            )
-            
-            logger.info(f"✅ Email sent to {to}")
-            logger.debug(f"Response: {response}")
+            if message_id:
+                # Use reply to maintain thread
+                response = self.agentmail.inboxes.messages.reply(
+                    inbox_id=self.inbox.inbox_id,
+                    message_id=message_id,
+                    text=content
+                )
+                logger.info(f"✅ Replied to message {message_id}")
+                logger.debug(f"Reply response: {response}")
+            else:
+                # Fallback: try to create new message (may not work for outbound)
+                logger.warning("No message_id - attempting to create new message")
+                try:
+                    response = self.agentmail.inboxes.messages.send(
+                        inbox_id=self.inbox.inbox_id,
+                        to=[to_email],
+                        subject=subject,
+                        text=content
+                    )
+                    logger.info(f"✅ Sent new message to {to_email}")
+                except Exception as send_error:
+                    logger.error(f"❌ Send failed: {send_error}")
+                    logger.info(f"📧 Would send: {content[:100]}...")
+                    return False
             
             # Store in conversation history
-            if thread_id:
-                if thread_id not in self.conversations:
-                    self.conversations[thread_id] = ""
-                self.conversations[thread_id] += f"\nOur response:\n{content}\n"
+            conversation_key = thread_id or message_id or to_email
+            if conversation_key:
+                if conversation_key not in self.conversations:
+                    self.conversations[conversation_key] = ""
+                self.conversations[conversation_key] += f"\nOur response:\n{content}\n"
             
             return True
             
-        except AttributeError as e:
-            logger.error(f"❌ AgentMail API structure error: {e}")
-            logger.error("Check if API method is inboxes.messages.create() or .reply()")
-            return False
         except Exception as e:
             logger.error(f"❌ Failed to send email: {e}")
             logger.error(f"Error type: {type(e).__name__}")
@@ -176,12 +186,9 @@ Write a response email that's helpful and professional."""
         """Categorize the type of email"""
         
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20250118",
+            model="claude-sonnet-4-20250514",
             max_tokens=50,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """Categorize this email into ONE of these categories:
+            system="""Categorize this email into ONE of these categories:
                     - new_application (someone applying for a job)
                     - scheduling_response (candidate providing availability)
                     - interviewer_feedback (interviewer responding about a candidate)
@@ -189,8 +196,8 @@ Write a response email that's helpful and professional."""
                     - follow_up (candidate following up on application)
                     - other
                     
-                    Respond with just the category name."""
-                },
+                    Respond with just the category name.""",
+            messages=[
                 {
                     "role": "user",
                     "content": email.content
@@ -206,19 +213,16 @@ Write a response email that's helpful and professional."""
         """Evaluate a candidate application"""
         
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20250118",
+            model="claude-sonnet-4-20250514",
             max_tokens=300,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """Evaluate this job application. Return a JSON response with:
+            system="""Evaluate this job application. Return a JSON response with:
                     - score (1-10): How qualified is this candidate?
                     - qualified (boolean): Should we move forward?
                     - missing_skills (list): What key skills are missing?
                     - strengths (list): What are their strengths?
                     - next_step (string): What should we do next?
-                    - reasoning (string): Brief explanation"""
-                },
+                    - reasoning (string): Brief explanation""",
+            messages=[
                 {
                     "role": "user",
                     "content": f"Application email:\n{email.content}"
@@ -248,7 +252,7 @@ Write a response email that's helpful and professional."""
                 "next_step": "reject"
             }
     
-    def process_new_application(self, email: EmailMessage):
+    def process_new_application(self, email: EmailMessage, message_id: str):
         """Handle new job application"""
         
         # Evaluate candidate
@@ -278,16 +282,17 @@ Write a response email that's helpful and professional."""
         
         # Send response
         self.send_email(
-            to=email.from_email,
+            to_email=email.from_email,
             subject=f"Re: {email.subject}" if not email.subject.startswith("Re:") else email.subject,
             content=response_content,
+            message_id=message_id,
             thread_id=email.thread_id
         )
         
         # If qualified, notify interviewer
         if evaluation["qualified"]:
             self.send_email(
-                to=self.interviewer_email,
+                to_email=self.interviewer_email,
                 subject=f"New Qualified Candidate: {email.from_email}",
                 content=f"""New candidate scored {evaluation['score']}/10:
 
@@ -300,12 +305,12 @@ Application:
 They will be scheduling a screening call soon."""
             )
     
-    def process_scheduling_response(self, email: EmailMessage):
+    def process_scheduling_response(self, email: EmailMessage, message_id: str):
         """Handle scheduling responses from candidates"""
         
         # Extract availability
         response = self.claude.messages.create(
-            model="claude-3-5-sonnet-20250118",
+            model="claude-sonnet-4-20250514",
             max_tokens=200,
             messages=[
                 {
@@ -319,7 +324,7 @@ They will be scheduling a screening call soon."""
         
         # Forward to interviewer
         self.send_email(
-            to=self.interviewer_email,
+            to_email=self.interviewer_email,
             subject=f"Interview Availability: {email.from_email}",
             content=f"""Candidate has provided availability:
 
@@ -338,9 +343,10 @@ Please reply with your preferred time."""
         )
         
         self.send_email(
-            to=email.from_email,
+            to_email=email.from_email,
             subject=f"Re: {email.subject}",
             content=response_content,
+            message_id=message_id,
             thread_id=email.thread_id
         )
         
@@ -352,16 +358,16 @@ Please reply with your preferred time."""
         """Main email processing logic"""
         
         # Skip if already processed
-        if message.id in self.processed_emails:
+        if message.message_id in self.processed_emails:
             return
         
         # Mark as processed
-        self.processed_emails.add(message.id)
+        self.processed_emails.add(message.message_id)
         
         # Create EmailMessage object
         email = EmailMessage(
-            id=message.id,
-            from_email=message.from_email,
+            id=message.message_id,
+            from_email=getattr(message, 'from_', ''),
             subject=message.subject or "No Subject",
             content=message.text or "",
             thread_id=getattr(message, 'thread_id', None)
@@ -379,23 +385,24 @@ Please reply with your preferred time."""
         category = self.categorize_email(email)
         
         if category == "new_application":
-            self.process_new_application(email)
+            self.process_new_application(email, message.message_id)
         elif category == "scheduling_response":
-            self.process_scheduling_response(email)
+            self.process_scheduling_response(email, message.message_id)
         elif email.from_email == self.interviewer_email:
             # Handle interviewer responses
-            self.handle_interviewer_response(email)
+            self.handle_interviewer_response(email, message.message_id)
         else:
             # General response for questions, follow-ups, etc.
             response_content = self.generate_response(email)
             self.send_email(
-                to=email.from_email,
+                to_email=email.from_email,
                 subject=f"Re: {email.subject}",
                 content=response_content,
+                message_id=message.message_id,
                 thread_id=email.thread_id
             )
     
-    def handle_interviewer_response(self, email: EmailMessage):
+    def handle_interviewer_response(self, email: EmailMessage, message_id: str):
         """Handle responses from interviewer"""
         # This is simplified - in production you'd parse the response
         # and forward confirmation to the right candidate
@@ -424,7 +431,7 @@ Please reply with your preferred time."""
                 # Process each message
                 new_messages = 0
                 for message in messages.messages:
-                    if message.id not in self.processed_emails:
+                    if message.message_id not in self.processed_emails:
                         new_messages += 1
                     self.process_email(message)
                 
@@ -447,6 +454,22 @@ Please reply with your preferred time."""
                 print("Waiting 30 seconds before retrying...")
                 time.sleep(30)
 
+def test_claude_model():
+    """Quick test to verify Claude model works"""
+    try:
+        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=10,
+            system="You are a helpful assistant.",
+            messages=[{"role": "user", "content": "test"}]
+        )
+        print("✅ Claude model claude-sonnet-4-20250514 is working!")
+        return True
+    except Exception as e:
+        print(f"❌ Claude model failed: {e}")
+        return False
+
 def main():
     """Entry point"""
     
@@ -457,6 +480,12 @@ def main():
     
     if not os.getenv("ANTHROPIC_API_KEY"):
         print("❌ Error: ANTHROPIC_API_KEY not set in .env file")
+        return
+    
+    # Test Claude model first
+    print("🧪 Testing Claude model...")
+    if not test_claude_model():
+        print("❌ Cannot start agent - Claude model not working")
         return
     
     # Create and run agent

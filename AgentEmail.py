@@ -87,7 +87,11 @@ class MailHubAgent:
                     inbox = inboxes.inboxes[0]
                     logger.info(f"Using existing inbox: {inbox.inbox_id}")
                     return inbox
-            except:
+                else:
+                    logger.error("No existing inboxes found")
+                    raise Exception("Could not create inbox and no existing inboxes available")
+            except Exception as inbox_error:
+                logger.error(f"Error retrieving existing inboxes: {inbox_error}")
                 raise Exception("Could not create or get inbox")
     
     def generate_response(self, email: EmailMessage, context: str = "") -> str:
@@ -219,12 +223,22 @@ Write a response email that's helpful and professional."""
             evaluation = json.loads(response.content[0].text)
             logger.info(f"📊 Candidate scored: {evaluation.get('score', 'N/A')}/10")
             return evaluation
-        except:
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse evaluation JSON: {e}")
+            logger.error(f"Raw response: {response.content[0].text}")
             return {
                 "score": 5,
                 "qualified": True,
-                "reasoning": "Could not parse evaluation",
+                "reasoning": "Could not parse evaluation - using default scoring",
                 "next_step": "schedule_screen"
+            }
+        except Exception as e:
+            logger.error(f"Error during candidate evaluation: {e}")
+            return {
+                "score": 3,
+                "qualified": False,
+                "reasoning": f"Evaluation failed: {str(e)}",
+                "next_step": "reject"
             }
     
     def process_new_application(self, email: EmailMessage):
@@ -385,6 +399,8 @@ Please reply with your preferred time."""
         print(f"\n🚀 MailHub Agent running!")
         print(f"📧 Inbox: {self.inbox.inbox_id}")
         print(f"⏰ Checking for emails every 10 seconds...")
+        print(f"📊 Current candidates: {len(self.candidates)}")
+        print(f"🗂️  Processed emails: {len(self.processed_emails)}")
         print(f"\nPress Ctrl+C to stop\n")
         
         while True:
@@ -395,9 +411,18 @@ Please reply with your preferred time."""
                     limit=20
                 )
                 
+                logger.info(f"📥 Found {len(messages.messages)} messages")
+                
                 # Process each message
+                new_messages = 0
                 for message in messages.messages:
+                    if message.id not in self.processed_emails:
+                        new_messages += 1
                     self.process_email(message)
+                
+                if new_messages > 0:
+                    logger.info(f"✅ Processed {new_messages} new messages")
+                    print(f"📊 Stats - Candidates: {len(self.candidates)} | Processed: {len(self.processed_emails)}")
                 
                 # Wait before next check
                 time.sleep(10)
@@ -407,6 +432,11 @@ Please reply with your preferred time."""
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                print(f"❌ Error occurred: {e}")
+                print("Waiting 30 seconds before retrying...")
                 time.sleep(30)
 
 def main():
